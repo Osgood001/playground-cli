@@ -9,7 +9,7 @@ import * as path from "node:path";
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type OptValue = string | boolean | string[];
 
-const VERSION = "0.1.7";
+const VERSION = "0.1.8";
 const DEFAULT_PLAY_API = "http://nwjs1473070.bohrium.tech:50002/api";
 const DEFAULT_WORKER_API = "http://nwjs1473070.bohrium.tech:50002/api";
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), ".playground", "config.json");
@@ -2077,7 +2077,58 @@ async function cmdDoctor(opts: Record<string, OptValue>): Promise<void> {
       };
     }
   }
-  console.log(JSON.stringify(results, null, 2));
+  if (!flag(opts, "quiet")) console.log(JSON.stringify(results, null, 2));
+}
+
+interface SubmissionIdentity {
+  declaredModel?: string;
+  declaredHarness?: string;
+  detectedModel?: string;
+  detectedHarness?: string;
+  model: string;
+  harness: string;
+}
+
+function mostFrequent(values: Array<string | undefined>): string | undefined {
+  const counts = new Map<string, number>();
+  for (const value of values) {
+    if (!value) continue;
+    counts.set(value, (counts.get(value) || 0) + 1);
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+}
+
+async function submissionIdentity(
+  opts: Record<string, OptValue>,
+  traceSteps: Record<string, Json>[],
+): Promise<SubmissionIdentity> {
+  const declaredModel = opt(opts, "model") || process.env.PLAYGROUND_MODEL;
+  const declaredHarness = opt(opts, "harness") || process.env.PLAYGROUND_HARNESS;
+  const detectedModel = mostFrequent(traceSteps.map((step) =>
+    stringValue(step.model_id) || stringValue(step.modelId) || stringValue(step.model_name) || stringValue(step.model),
+  ));
+  let detectedHarness: string | undefined;
+  const traceFormat = (opt(opts, "trace-format") || "").toLowerCase();
+  const tracePath = opt(opts, "trace");
+  if (traceFormat && traceFormat !== "auto" && traceFormat !== "arm") detectedHarness = traceFormat;
+  if (!detectedHarness && tracePath) {
+    const text = await fs.readFile(path.resolve(tracePath), "utf8");
+    const rows = objectRowsFromJsonl(text);
+    const lower = text.slice(0, 2_000_000).toLowerCase();
+    if (opencodeEventLike(rows) || /\bopencode\b/.test(lower)) detectedHarness = "opencode";
+    else if (claudeCodeEventLike(rows) || /\bclaude[-_ ]?code\b/.test(lower)) detectedHarness = "claude-code";
+    else if (/\bcodex\b/.test(lower)) detectedHarness = "codex";
+    else if (/\b(openclaw|arkclaw)\b/.test(lower)) detectedHarness = "openclaw";
+    else if (/\bharbor[-_ ]?lbg\b/.test(lower)) detectedHarness = "harbor-lbg";
+  }
+  return {
+    declaredModel,
+    declaredHarness,
+    detectedModel,
+    detectedHarness,
+    model: declaredModel || detectedModel || "unknown",
+    harness: declaredHarness || detectedHarness || "harbor-lbg",
+  };
 }
 
 function defaultTraceSteps(opts: Record<string, OptValue>, outputFiles: string[]): Record<string, Json>[] {
@@ -2240,6 +2291,7 @@ async function makeArmBundle(opts: Record<string, OptValue>): Promise<BundleResu
 
     const outputFiles = (await listFiles(path.join(stage, "outputs"))).map((file) => path.relative(stage, file).replaceAll(path.sep, "/"));
     const traceSteps = await loadTraceSteps(opts, outputFiles);
+    const identity = await submissionIdentity(opts, traceSteps);
     const existingTimestamps = traceSteps.map((step) => timestampMillis(step.timestamp));
     const firstTimestampIndex = existingTimestamps.findIndex((millis) => millis !== undefined);
     const fallbackStart = firstTimestampIndex >= 0
@@ -2294,8 +2346,14 @@ async function makeArmBundle(opts: Record<string, OptValue>): Promise<BundleResu
         challenge_id: challengeId,
         task_id: opt(opts, "task-id") || challengeId,
         run_id: runId,
-        model: opt(opts, "model") || "unknown",
-        harness: opt(opts, "harness") || "harbor-lbg",
+        model: identity.model,
+        harness: identity.harness,
+        declared_model: identity.declaredModel || "",
+        declared_harness: identity.declaredHarness || "",
+        detected_model: identity.detectedModel || "",
+        detected_harness: identity.detectedHarness || "",
+        model_source: identity.declaredModel ? "declared" : identity.detectedModel ? "detected" : "fallback",
+        harness_source: identity.declaredHarness ? "declared" : identity.detectedHarness ? "detected" : "fallback",
       },
     };
     const submission: Record<string, Json> = {
@@ -2308,10 +2366,10 @@ async function makeArmBundle(opts: Record<string, OptValue>): Promise<BundleResu
       agent: {
         name: opt(opts, "agent-name") || "playground-cli",
         version: opt(opts, "agent-version") || VERSION,
-        model: opt(opts, "model") || "unknown",
+        model: identity.model,
       },
       harness: {
-        name: opt(opts, "harness") || "harbor-lbg",
+        name: identity.harness,
         native_trace_format: opt(opts, "trace-format") || (tracePath ? "auto" : "arm"),
       },
       artifacts: [] as unknown as Json,
@@ -2408,6 +2466,7 @@ async function cmdSubmit(opts: Record<string, OptValue>): Promise<void> {
     traceSteps = await loadTraceSteps(opts, []);
   }
   const bundleSha256 = await sha256File(bundlePath);
+  const identity = await submissionIdentity(opts, traceSteps);
   if (flag(opts, "dry-run")) {
     console.log(JSON.stringify({ status: "dry_run", bundle: bundlePath, bundle_sha256: bundleSha256, manifest, trace_steps: traceSteps }, null, 2));
     return;
@@ -2431,8 +2490,8 @@ async function cmdSubmit(opts: Record<string, OptValue>): Promise<void> {
   }
   const attemptFields: Record<string, string> = {
     method: opt(opts, "method") || "Playground CLI submission",
-    model: opt(opts, "model") || "unknown",
-    harness: opt(opts, "harness") || "harbor-lbg",
+    model: identity.model,
+    harness: identity.harness,
     type: "agent",
     status: "submitted",
     detail: opt(opts, "detail") || `Submitted by @paper2arm/playground-cli ${VERSION}.`,
@@ -2784,12 +2843,15 @@ Usage:
   playground data pull --dataset DATASET --version VERSION [--out data-dir/]
   playground data list [--search TEXT] [--limit 20] [--all]
   playground submit --challenge-id ID --outputs outputs-dir [--trace native-trace] [--raw-messages raw.jsonl]
+                    [--model MODEL] [--harness HARNESS]
   playground status --attempt-id ID [--bundle]
   playground doctor [--install-trisol]
 
 Important environment variables:
   PLAYGROUND_TOKEN          Bearer token, if the deployed Playground requires one
   PLAYGROUND_API_BASE       Optional override for the built-in Playground API
+  PLAYGROUND_MODEL          Optional self-reported model (same as --model)
+  PLAYGROUND_HARNESS        Optional self-reported harness (same as --harness)
 `);
 }
 

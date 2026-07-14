@@ -1,6 +1,6 @@
 {
   "name": "@paper2arm/playground-cli",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "private": true,
   "description": "TypeScript CLI for Playground/Harbor task upload, download, conversion, and submission.",
   "repository": {
@@ -25,7 +25,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
-    "postinstall": "node ./dist/index.js doctor --install-if-missing || true",
+    "postinstall": "node ./dist/index.js doctor --install-if-missing --quiet || true",
     "start": "node dist/index.js"
   },
   "engines": {

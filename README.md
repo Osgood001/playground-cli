@@ -163,6 +163,13 @@ playground submit \
   --harness harbor-lbg
 ```
 
+`--model` and `--harness` are the submitter's self-report and take priority.
+When either is omitted, the CLI derives a best-effort value from the native
+trace. The ARM manifest records the declared, detected, and finally resolved
+values separately so operators can audit mismatches without silently replacing
+the submitter's claim. `PLAYGROUND_MODEL` and `PLAYGROUND_HARNESS` provide the
+same self-report fields for scripted environments.
+
 If `--trace` points at a Harbor/OpenCode/Claude/OpenClaw native trace, the CLI converts it to ARM steps and also packages a redacted `raw_messages.jsonl` at the bundle root for Playground/ATIF-style replay.
 
 Dry-run locally:
