@@ -9,9 +9,11 @@ import * as path from "node:path";
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type OptValue = string | boolean | string[];
 
-const VERSION = "0.1.10";
-const DEFAULT_PLAY_API = "http://nwjs1473070.bohrium.tech:50002/api";
-const DEFAULT_WORKER_API = "http://nwjs1473070.bohrium.tech:50002/api";
+const VERSION = "0.1.11";
+const DEFAULT_PLAY_API = "http://vxzj1507371.bohrium.tech:50001/api";
+// Defaults to the compatible upload route until a distinct public worker URL
+// is configured. PLAYGROUND_WORKER_API_BASE switches only bundle upload.
+const DEFAULT_WORKER_API = "http://vxzj1507371.bohrium.tech:50001/api";
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), ".playground", "config.json");
 const DEFAULT_TRISOL_INSTALLER = "https://trisol.dp.tech/install.sh";
 const DEFAULT_TRISOL_TEAM = "2076600516862812160";
@@ -2477,8 +2479,12 @@ async function makeArmBundle(opts: Record<string, OptValue>): Promise<BundleResu
 
 async function cmdSubmit(opts: Record<string, OptValue>): Promise<void> {
   const config = await loadConfig(opts);
-  const base = apiBase(opts, config);
-  const token = bearerToken(opts, config);
+  const playOpts = { ...opts, target: "play" };
+  const workerOpts = { ...opts, target: "worker" };
+  const base = apiBase(playOpts, config);
+  const token = bearerToken(playOpts, config);
+  const workerBase = apiBase(workerOpts, config);
+  const workerToken = bearerToken(workerOpts, config);
   const challengeId = required(opts, "challenge-id");
   let bundlePath = opt(opts, "bundle") ? path.resolve(required(opts, "bundle")) : "";
   let manifest: Record<string, Json> = {};
@@ -2541,22 +2547,24 @@ async function cmdSubmit(opts: Record<string, OptValue>): Promise<void> {
   );
   const attemptId = String(attempt.id);
   if (!attemptId || attemptId === "undefined") throw new CliError(`attempt response did not include id: ${JSON.stringify(attempt)}`);
+  const separateWorker = workerBase !== base;
   const bundleResponse = await postMultipartJson<Record<string, Json>>(
-    `${base}/attempts/${encodeURIComponent(attemptId)}/bundle`,
-    {},
+    separateWorker ? `${workerBase}/uploads` : `${base}/attempts/${encodeURIComponent(attemptId)}/bundle`,
+    separateWorker ? { attempt_id: attemptId, challenge_id: challengeId } : {},
     [{
       name: "bundle",
       filename: path.basename(bundlePath),
       contentType: "application/zip",
       data: await fs.readFile(bundlePath),
     }],
-    token,
+    separateWorker ? workerToken : token,
   );
   console.log(JSON.stringify({
     schema_version: "playground-cli-submission/v0",
     status: "submitted",
     target: targetName(opts, config),
     api_base: base,
+    worker_api_base: workerBase,
     challenge_id: challengeId,
     attempt_id: attemptId,
     attempt_url: `${publicBaseFromApi(base)}/#challenge/${challengeId}`,
