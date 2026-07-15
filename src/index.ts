@@ -9,7 +9,7 @@ import * as path from "node:path";
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type OptValue = string | boolean | string[];
 
-const VERSION = "0.1.14";
+const VERSION = "0.1.15";
 const DEFAULT_PLAY_API = "http://vxzj1507371.bohrium.tech:50001/api";
 const DEFAULT_WORKER_API = "http://47.92.88.121:443/api";
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), ".playground", "config.json");
@@ -2719,7 +2719,7 @@ async function cmdSubmit(opts: Record<string, OptValue>): Promise<void> {
   const separateWorker = workerBase !== base;
   const bundleResponse = await postMultipartJson<Record<string, Json>>(
     separateWorker ? `${workerBase}/uploads` : `${base}/attempts/${encodeURIComponent(attemptId)}/bundle`,
-    separateWorker ? { attempt_id: attemptId, challenge_id: challengeId } : {},
+    separateWorker ? { attempt_id: attemptId, challenge_id: challengeId, playground_token: token || "" } : {},
     [{
       name: "bundle",
       filename: path.basename(bundlePath),
