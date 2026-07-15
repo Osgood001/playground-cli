@@ -9,11 +9,9 @@ import * as path from "node:path";
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type OptValue = string | boolean | string[];
 
-const VERSION = "0.1.11";
+const VERSION = "0.1.12";
 const DEFAULT_PLAY_API = "http://vxzj1507371.bohrium.tech:50001/api";
-// Defaults to the compatible upload route until a distinct public worker URL
-// is configured. PLAYGROUND_WORKER_API_BASE switches only bundle upload.
-const DEFAULT_WORKER_API = "http://vxzj1507371.bohrium.tech:50001/api";
+const DEFAULT_WORKER_API = "http://47.92.88.121:443/api";
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), ".playground", "config.json");
 const DEFAULT_TRISOL_INSTALLER = "https://trisol.dp.tech/install.sh";
 const DEFAULT_TRISOL_TEAM = "2076600516862812160";
