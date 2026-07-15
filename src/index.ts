@@ -9,7 +9,7 @@ import * as path from "node:path";
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type OptValue = string | boolean | string[];
 
-const VERSION = "0.1.8";
+const VERSION = "0.1.10";
 const DEFAULT_PLAY_API = "http://nwjs1473070.bohrium.tech:50002/api";
 const DEFAULT_WORKER_API = "http://nwjs1473070.bohrium.tech:50002/api";
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), ".playground", "config.json");
@@ -951,6 +951,45 @@ function convertMessageRows(rows: Record<string, any>[], source: string): Record
   return steps;
 }
 
+function codexEventLike(rows: Record<string, any>[]): boolean {
+  return rows.some((row) => row.type === "thread.started")
+    && rows.some((row) => row.type === "item.started" || row.type === "item.completed" || row.type === "turn.completed");
+}
+
+function convertCodexEvents(rows: Record<string, any>[], source: string): Record<string, Json>[] {
+  const steps: Record<string, Json>[] = [];
+  const pending = new Set<string>();
+  for (const [index, row] of rows.entries()) {
+    const eventType = stringValue(row.type) || "event";
+    const item = asPlainObject(row.item) || {};
+    const itemType = stringValue(item.type) || "";
+    const id = stringValue(item.id) || stableStepId("codex", source, index);
+    const timestamp = timestampValue(row.timestamp) || utcNow();
+    if (eventType === "item.started" && itemType === "command_execution") {
+      pending.add(id);
+      steps.push({ step_type: "tool_call", type: "tool_call", step_id: stableStepId("tc", source, index),
+        step_order: steps.length + 1, tool_call_id: id, tool_name: "shell",
+        tool_args: { command: stringValue(item.command) || "" }, timestamp });
+    } else if (eventType === "item.completed" && itemType === "command_execution") {
+      pending.delete(id);
+      steps.push({ step_type: "tool_result", type: "tool_result", step_id: stableStepId("tr", source, index),
+        step_order: steps.length + 1, tool_call_id: id,
+        tool_output: stringValue(item.aggregated_output) || "", timestamp });
+    } else if (eventType === "item.completed" && ["agent_message", "reasoning"].includes(itemType)) {
+      steps.push({ step_type: "thought", type: "thought", step_id: stableStepId("thought", source, index),
+        step_order: steps.length + 1, body: (stringValue(item.text) || stringValue(item.message) || bodyFromContent(item)).slice(0, 8000), timestamp });
+    } else if (eventType === "item.completed" && itemType === "error") {
+      steps.push({ step_type: "error", type: "error", step_id: stableStepId("err", source, index),
+        step_order: steps.length + 1, body: (stringValue(item.message) || bodyFromContent(item)).slice(0, 8000), timestamp });
+    }
+  }
+  for (const id of pending) {
+    steps.push({ step_type: "error", type: "error", step_id: stableStepId("err", source, steps.length),
+      step_order: steps.length + 1, tool_call_id: id, body: `Codex command ${id} has no result at capture time.`, timestamp: utcNow() });
+  }
+  return steps;
+}
+
 function parseTraceSteps(text: string, source = "trace"): Record<string, Json>[] {
   try {
     const parsed = JSON.parse(text);
@@ -982,6 +1021,7 @@ function parseTraceSteps(text: string, source = "trace"): Record<string, Json>[]
   if (normalized.length >= Math.max(1, Math.floor(rows.length * 0.8))) return normalized;
   if (opencodeEventLike(rows)) return convertOpenCodeEvents(rows, source);
   if (claudeCodeEventLike(rows)) return convertClaudeCodeEvents(rows, source);
+  if (codexEventLike(rows)) return convertCodexEvents(rows, source);
   if (nativeTraceLike(rows)) return convertNativeTrajectoryRows(rows, source);
   if (rows.some((row) => row.role || row.source || row.content)) return convertMessageRows(rows, source);
   return [];
@@ -2131,71 +2171,62 @@ async function submissionIdentity(
   };
 }
 
-function defaultTraceSteps(opts: Record<string, OptValue>, outputFiles: string[]): Record<string, Json>[] {
-  const timestamp = utcNow();
-  const firstOutput = outputFiles[0] || "outputs";
-  const model = opt(opts, "model") || "unknown";
-  return [
-    {
-      step_type: "thought",
-      type: "thought",
-      step_order: 1,
-      title: "Prepare Playground submission",
-      body: `Packaged submission for ${required(opts, "challenge-id")} using ${model}.`,
-      timestamp,
-      cost_usd: 0,
-    },
-    {
-      step_type: "tool_call",
-      type: "tool_call",
-      step_order: 2,
-      title: "Package outputs",
-      body: "Generated an ARM v1.1 bundle with outputs, logs, manifest, characterization, and trace.",
-      tool_name: "playground-cli",
-      tool_call_id: "playground-cli-package",
-      tool_args: { outputs: outputFiles },
-      timestamp,
-      cost_usd: 0,
-    },
-    {
-      step_type: "artifact",
-      type: "artifact",
-      step_order: 3,
-      title: "Submitted output artifact",
-      body: "Submitted outputs are attached for Playground and Harbor evaluation.",
-      artifact_path: firstOutput,
-      timestamp,
-      cost_usd: 0,
-    },
+type DetectedTrace = { path: string; harness: string };
+
+async function detectNativeTrace(): Promise<DetectedTrace | undefined> {
+  const configured = process.env.PLAYGROUND_TRACE;
+  const candidates: DetectedTrace[] = [
+    ...(configured ? [{ path: configured, harness: process.env.PLAYGROUND_HARNESS || "auto" }] : []),
+    { path: "/logs/agent/opencode.txt", harness: "opencode" },
+    { path: "/logs/agent/codex.txt", harness: "codex" },
+    { path: "/logs/agent/claude-code.txt", harness: "claude-code" },
+    { path: "/logs/agent/claude_code.txt", harness: "claude-code" },
+    { path: "/logs/agent/claude.txt", harness: "claude-code" },
   ];
+  const present: Array<DetectedTrace & { mtimeMs: number }> = [];
+  for (const candidate of candidates) {
+    const resolved = path.resolve(candidate.path);
+    try {
+      const stat = await fs.stat(resolved);
+      if (stat.isFile() && stat.size > 0) present.push({ ...candidate, path: resolved, mtimeMs: stat.mtimeMs });
+    } catch {
+      // Candidate is not present in this harness.
+    }
+  }
+  present.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return present[0];
+}
+
+async function ensureSubmissionTrace(opts: Record<string, OptValue>): Promise<void> {
+  if (opt(opts, "trace")) return;
+  const detected = await detectNativeTrace();
+  if (!detected) {
+    throw new CliError(
+      "could not auto-detect a native agent trace; rerun with --trace PATH " +
+      "(and optionally --trace-format opencode|codex|claude-code)",
+    );
+  }
+  opts.trace = detected.path;
+  if (!opt(opts, "trace-format") && detected.harness !== "auto") opts["trace-format"] = detected.harness;
 }
 
 async function loadTraceSteps(opts: Record<string, OptValue>, outputFiles: string[]): Promise<Record<string, Json>[]> {
   const trace = opt(opts, "trace");
-  if (!trace) return defaultTraceSteps(opts, outputFiles);
+  if (!trace) throw new CliError("submission requires a native trace; pass --trace PATH");
   const tracePath = path.resolve(trace);
   const text = await fs.readFile(tracePath, "utf8");
   const parsedSteps = parseTraceSteps(text, path.basename(tracePath));
   if (parsedSteps.length) return parsedSteps;
-  return [
-    ...defaultTraceSteps(opts, outputFiles),
-    {
-      step_type: "artifact",
-      type: "artifact",
-      step_order: 4,
-      title: "Native trajectory packaged",
-      body: "Native trajectory is packaged in the ARM bundle for offline inspection.",
-      artifact_path: `native_trace/${path.basename(trace)}`,
-      timestamp: utcNow(),
-      cost_usd: 0,
-    },
-  ];
+  throw new CliError(`could not derive normalized trace steps from native trace ${tracePath}`);
 }
 
 async function writeRawMessages(stage: string, source: string): Promise<{ data: Buffer; path: string; redactions: number }> {
   const raw = await fs.readFile(source, "utf8");
   const redacted = redactTraceText(raw);
-  const data = Buffer.from(redacted.text, "utf8");
+  const rows = objectRowsFromJsonl(redacted.text);
+  const hasSessionStart = stringValue(rows[0]?.type) === "session_start";
+  const envelope = hasSessionStart ? "" : `${JSON.stringify({ type: "session_start", source: "playground-cli-auto-detect" })}\n`;
+  const data = Buffer.from(`${envelope}${redacted.text}${redacted.text.endsWith("\n") ? "" : "\n"}`, "utf8");
   const rootTarget = path.join(stage, "raw_messages.jsonl");
   const tracesTarget = path.join(stage, "traces", "raw_messages.jsonl");
   await fs.mkdir(path.dirname(tracesTarget), { recursive: true });
@@ -2455,6 +2486,7 @@ async function cmdSubmit(opts: Record<string, OptValue>): Promise<void> {
   let rawMessagesData: Buffer | undefined;
   let rawMessagesFilename: string | undefined;
   if (!bundlePath) {
+    await ensureSubmissionTrace(opts);
     const built = await makeArmBundle(opts);
     bundlePath = built.bundlePath;
     manifest = built.manifest;
@@ -2852,6 +2884,8 @@ Important environment variables:
   PLAYGROUND_API_BASE       Optional override for the built-in Playground API
   PLAYGROUND_MODEL          Optional self-reported model (same as --model)
   PLAYGROUND_HARNESS        Optional self-reported harness (same as --harness)
+  PLAYGROUND_TRACE          Optional native trace path; submit auto-detects OpenCode,
+                            Codex, and Claude Code traces under /logs/agent first
 `);
 }
 

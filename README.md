@@ -172,6 +172,11 @@ same self-report fields for scripted environments.
 
 If `--trace` points at a Harbor/OpenCode/Claude/OpenClaw native trace, the CLI converts it to ARM steps and also packages a redacted `raw_messages.jsonl` at the bundle root for Playground/ATIF-style replay.
 
+When `--trace` is omitted, `playground submit` auto-detects live OpenCode,
+Codex, and Claude Code traces under `/logs/agent`. If no native trace can be
+found, submission fails and asks for `--trace PATH`; it never substitutes a
+synthetic trace. `PLAYGROUND_TRACE` supports non-standard layouts.
+
 Dry-run locally:
 
 ```bash
