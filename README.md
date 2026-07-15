@@ -6,6 +6,7 @@ It supports:
 
 - install-and-use defaults for the deployed Playground endpoint
 - automatic dataset pulls through the Playground installer
+- automatic Trisol model and dataset pulls declared by task config
 - hidden dataset downloads when a challenge declares dataset refs
 - Harbor task directory to Playground challenge conversion
 - Harbor ATIF, OpenCode, Claude Code, and OpenClaw/ArkClaw traces to ARM v1.1 conversion
@@ -124,6 +125,12 @@ If the challenge metadata declares datasets, `task download` also fetches those
 files into `./downloaded-challenge/datasets/...` automatically. The implementation
 uses the Playground data wrapper under the hood, but contestants do not need to call Trisol directly.
 Use `--skip-datasets` only for metadata-only downloads.
+
+When a challenge declares Trisol `model`/`models` and `dataset`/`datasets`
+references, the same command writes `config.json` and downloads both resource kinds
+under `models/` and `datasets/`. Use `--skip-models` only when weights are
+intentionally unnecessary. References without versions resolve to the latest ready
+Trisol version.
 
 ## Pull Dataset Files
 

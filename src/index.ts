@@ -9,13 +9,28 @@ import * as path from "node:path";
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type OptValue = string | boolean | string[];
 
-const VERSION = "0.1.12";
+const VERSION = "0.1.13";
 const DEFAULT_PLAY_API = "http://vxzj1507371.bohrium.tech:50001/api";
 const DEFAULT_WORKER_API = "http://47.92.88.121:443/api";
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), ".playground", "config.json");
 const DEFAULT_TRISOL_INSTALLER = "https://trisol.dp.tech/install.sh";
 const DEFAULT_TRISOL_TEAM = "2076600516862812160";
 const DEFAULT_DATA_LIST_LIMIT = 20;
+const BUILTIN_TASK_CONFIGS: Record<string, Record<string, Json>> = {
+  "cluster-17187547-paper-811029921265614849": {
+    id: "cluster-17187547-paper-811029921265614849",
+    trisol: {
+      model: { model: "esm2-150m-protein-language-model", version: "v0.1" },
+      datasets: [
+        { dataset: "uniprot-goa", version: "v1" },
+        { dataset: "native-protein-structures-pdb", version: "v1.0" },
+        { dataset: "biolip", version: "v1" },
+        { dataset: "string-database-v11-0", version: "v11.0" },
+        { dataset: "uniref90-sequence-clusters", version: "v0.1" },
+      ],
+    },
+  },
+};
 const EMBEDDED_TRISOL_TOKEN = "trp_Oz6VMMtJgTx3_LRDhoZToY3sNykBxpwFITdr25Zu4bJ1T";
 const SECRET_PATTERNS = [
   /BOHRIUM_ACCESS_KEY\s*=/i,
@@ -81,8 +96,14 @@ interface MultipartFile {
 
 interface TrisolDatasetRef {
   dataset: string;
-  version: string;
+  version?: string;
   split?: string;
+  path?: string;
+}
+
+interface TrisolModelRef {
+  model: string;
+  version?: string;
   path?: string;
 }
 
@@ -1511,10 +1532,15 @@ function datasetRefFromObject(obj: Record<string, any>): TrisolDatasetRef[] {
 }
 
 function collectDatasetRefs(value: unknown): TrisolDatasetRef[] {
+  if (typeof value === "string" && value.trim()) {
+    const parts = value.split(":");
+    return [{ dataset: parts[0], version: parts[1] || undefined }];
+  }
   if (Array.isArray(value)) return value.flatMap(collectDatasetRefs);
   const obj = asPlainObject(value);
   if (!obj) return [];
   const direct = datasetRefFromObject(obj);
+  if (direct.length) return direct;
   const nested = ["dataset", "datasets", "data", "resources", "assets"]
     .filter((key) => obj[key] !== value)
     .flatMap((key) => collectDatasetRefs(obj[key]));
@@ -1522,7 +1548,14 @@ function collectDatasetRefs(value: unknown): TrisolDatasetRef[] {
 }
 
 function datasetRefsFromChallenge(challenge: Record<string, any>): TrisolDatasetRef[] {
-  const refs = [
+  const config = configFromChallenge(challenge) || BUILTIN_TASK_CONFIGS[stringValue(challenge.id) || ""];
+  const configRefs = [
+    ...collectDatasetRefs(config?.datasets),
+    ...collectDatasetRefs(config?.dataset),
+    ...collectDatasetRefs(asPlainObject(config?.trisol)?.datasets),
+    ...collectDatasetRefs(asPlainObject(config?.trisol)?.dataset),
+  ];
+  const refs = configRefs.length ? configRefs : [
     ...collectDatasetRefs(challenge.datasets),
     ...collectDatasetRefs(challenge.dataset),
     ...collectDatasetRefs(challenge.data),
@@ -1533,6 +1566,86 @@ function datasetRefsFromChallenge(challenge: Record<string, any>): TrisolDataset
   const seen = new Set<string>();
   return refs.filter((ref) => {
     const key = `${ref.dataset}\u0000${ref.version}\u0000${ref.path || ""}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function modelRefFromObject(obj: Record<string, any>): TrisolModelRef[] {
+  const model = stringValue(obj.model)
+    || stringValue(obj.model_id)
+    || stringValue(obj.modelId)
+    || stringValue(obj.id)
+    || stringValue(obj.name);
+  const version = stringValue(obj.version)
+    || stringValue(obj.version_code)
+    || stringValue(obj.versionCode)
+    || stringValue(obj.version_name)
+    || stringValue(obj.versionName);
+  const output = stringValue(obj.path) || stringValue(obj.output) || stringValue(obj.local_path);
+  return model ? [{ model, version, path: output }] : [];
+}
+
+function collectModelRefs(value: unknown): TrisolModelRef[] {
+  if (typeof value === "string" && value.trim()) {
+    const index = value.lastIndexOf(":");
+    return index > 0
+      ? [{ model: value.slice(0, index), version: value.slice(index + 1) }]
+      : [{ model: value }];
+  }
+  if (Array.isArray(value)) return value.flatMap(collectModelRefs);
+  const obj = asPlainObject(value);
+  if (!obj) return [];
+  const direct = modelRefFromObject(obj);
+  if (direct.length) return direct;
+  const nested = ["model", "models", "weights", "checkpoints", "resources", "assets"]
+    .filter((key) => obj[key] !== value)
+    .flatMap((key) => collectModelRefs(obj[key]));
+  return [...direct, ...nested];
+}
+
+function configFromChallenge(challenge: Record<string, any>): Record<string, any> | undefined {
+  const candidates = [
+    challenge.config,
+    challenge.config_json,
+    challenge.configJson,
+    challenge.task_config,
+    challenge.taskConfig,
+    asPlainObject(challenge.meta)?.config,
+    asPlainObject(challenge.metadata)?.config,
+  ];
+  for (const candidate of candidates) {
+    const obj = asPlainObject(candidate);
+    if (obj) return obj;
+    if (typeof candidate === "string" && candidate.trim().startsWith("{")) {
+      try {
+        const parsed = JSON.parse(candidate);
+        const parsedObj = asPlainObject(parsed);
+        if (parsedObj) return parsedObj;
+      } catch {
+        // Keep looking; malformed optional config should not hide other sources.
+      }
+    }
+  }
+  return undefined;
+}
+
+function modelRefsFromChallenge(challenge: Record<string, any>): TrisolModelRef[] {
+  const config = configFromChallenge(challenge) || BUILTIN_TASK_CONFIGS[stringValue(challenge.id) || ""];
+  const refs = [
+    ...collectModelRefs(challenge.models),
+    ...collectModelRefs(challenge.model),
+    ...collectModelRefs(asPlainObject(challenge.meta)?.models),
+    ...collectModelRefs(asPlainObject(challenge.meta)?.model),
+    ...collectModelRefs(config?.models),
+    ...collectModelRefs(config?.model),
+    ...collectModelRefs(asPlainObject(config?.trisol)?.models),
+    ...collectModelRefs(asPlainObject(config?.trisol)?.model),
+  ];
+  const seen = new Set<string>();
+  return refs.filter((ref) => {
+    const key = `${ref.model}\u0000${ref.version || ""}\u0000${ref.path || ""}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -1643,21 +1756,28 @@ async function getTrisolDatasetPayload(opts: Record<string, OptValue>, dataset: 
 async function resolveTrisolDatasetSplits(
   opts: Record<string, OptValue>,
   ref: TrisolDatasetRef,
-): Promise<{ split: string; size_bytes?: number }[]> {
-  if (ref.split && flag(opts, "split-only")) return [{ split: ref.split }];
+): Promise<{ version: string; splits: { split: string; size_bytes?: number }[] }> {
   const payload = await getTrisolDatasetPayload(opts, ref.dataset);
   const obj = asPlainObject(payload);
   const versions = Array.isArray(obj?.versions) ? obj.versions.map(asPlainObject).filter(isPlainRecord) : [];
-  const versionObj = versions.find((item) => versionCandidateValues(item).includes(ref.version));
+  const readyVersions = versions.filter((item) => !stringValue(item.status) || /ready|complete|available/i.test(stringValue(item.status) || ""));
+  const versionObj = ref.version
+    ? versions.find((item) => versionCandidateValues(item).includes(ref.version as string))
+    : readyVersions[0] || versions[0];
   if (!versionObj) {
     const available = versions.flatMap(versionCandidateValues).filter(Boolean).join(", ") || "(none)";
-    throw new CliError(`dataset '${ref.dataset}' has no version '${ref.version}'. Available versions: ${available}`);
+    throw new CliError(ref.version
+      ? `dataset '${ref.dataset}' has no version '${ref.version}'. Available versions: ${available}`
+      : `dataset '${ref.dataset}' has no downloadable version`);
   }
+  const resolvedVersion = versionCandidateValues(versionObj)[0];
+  if (!resolvedVersion) throw new CliError(`dataset '${ref.dataset}' version metadata has no usable version identifier`);
+  if (ref.split && flag(opts, "split-only")) return { version: resolvedVersion, splits: [{ split: ref.split }] };
   const splits = collectVersionSplits(versionObj);
   if (splits.length === 0) {
-    throw new CliError(`dataset '${ref.dataset}' version '${ref.version}' has no downloadable files`);
+    throw new CliError(`dataset '${ref.dataset}' version '${resolvedVersion}' has no downloadable files`);
   }
-  return splits;
+  return { version: resolvedVersion, splits };
 }
 
 async function downloadTrisolDataset(
@@ -1666,7 +1786,8 @@ async function downloadTrisolDataset(
   outPath: string,
   outputIsDirectory = false,
 ): Promise<{ dataset: string; version: string; output: string; files: TrisolDatasetFile[] }> {
-  const splits = await resolveTrisolDatasetSplits(opts, ref);
+  const resolved = await resolveTrisolDatasetSplits(opts, ref);
+  const { splits } = resolved;
   const wholeVersion = splits.length !== 1 || !ref.split || !flag(opts, "split-only");
   const useDirectory = outputIsDirectory || wholeVersion;
   if (useDirectory) {
@@ -1682,7 +1803,7 @@ async function downloadTrisolDataset(
         "dataset",
         "download",
         ref.dataset,
-        ref.version,
+        resolved.version,
         split.split,
         "--output",
         trisolOutput,
@@ -1694,7 +1815,20 @@ async function downloadTrisolDataset(
       size_bytes: split.size_bytes,
     });
   }
-  return { dataset: ref.dataset, version: ref.version, output: outPath, files };
+  return { dataset: ref.dataset, version: resolved.version, output: outPath, files };
+}
+
+async function downloadTrisolModel(
+  opts: Record<string, OptValue>,
+  ref: TrisolModelRef,
+  outPath: string,
+): Promise<{ model: string; version: string; output: string }> {
+  await fs.mkdir(outPath, { recursive: true });
+  const modelRef = ref.version ? `${ref.model}:${ref.version}` : `${ref.model}:latest`;
+  if (!flag(opts, "dry-run")) {
+    await runTrisol(opts, ["model", "download", modelRef, "--output", `${outPath}${path.sep}`]);
+  }
+  return { model: ref.model, version: ref.version || "latest", output: outPath };
 }
 
 function parseTomlStringField(text: string, field: string): string | undefined {
@@ -1871,6 +2005,16 @@ async function cmdHarborConvert(opts: Record<string, OptValue>): Promise<void> {
   };
   await fs.mkdir(outDir, { recursive: true });
   await writeJsonFile(path.join(outDir, "challenge.json"), challenge);
+  const suppliedConfig = configFromChallenge(challenge) || BUILTIN_TASK_CONFIGS[challengeId];
+  const portableConfig: Record<string, Json> = suppliedConfig || {
+    id: challengeId,
+    trisol: {
+      datasets: (challenge.datasets || challenge.dataset || []) as Json,
+      models: (challenge.models || challenge.model || []) as Json,
+    },
+  };
+  if (!portableConfig.id) portableConfig.id = challengeId;
+  await writeJsonFile(path.join(outDir, "config.json"), portableConfig);
   await fs.writeFile(path.join(outDir, "task.md"), content);
   await fs.writeFile(path.join(outDir, "rubric.md"), [
     "# Rubric",
@@ -1988,18 +2132,37 @@ async function cmdTaskDownload(opts: Record<string, OptValue>): Promise<void> {
   }
   await fs.mkdir(outDir, { recursive: true });
   await writeJsonFile(path.join(outDir, "challenge.json"), challenge);
+  const suppliedConfig = configFromChallenge(challenge) || BUILTIN_TASK_CONFIGS[challengeId];
+  const portableConfig: Record<string, Json> = suppliedConfig || {
+    id: challengeId,
+    trisol: {
+      datasets: (challenge.datasets || challenge.dataset || []) as Json,
+      models: (challenge.models || challenge.model || []) as Json,
+    },
+  };
+  if (!portableConfig.id) portableConfig.id = challengeId;
+  await writeJsonFile(path.join(outDir, "config.json"), portableConfig);
   if (typeof challenge.content === "string") await fs.writeFile(path.join(outDir, "task.md"), challenge.content);
   if (typeof challenge.rubric === "string") await fs.writeFile(path.join(outDir, "rubric.md"), challenge.rubric);
   const datasetRefs = flag(opts, "skip-datasets") ? [] : datasetRefsFromChallenge(challenge);
+  const modelRefs = flag(opts, "skip-models") ? [] : modelRefsFromChallenge(challenge);
   const datasetRoot = path.resolve(opt(opts, "dataset-out") || path.join(outDir, "datasets"));
   const datasetDownloads: Awaited<ReturnType<typeof downloadTrisolDataset>>[] = [];
   for (const ref of datasetRefs) {
     const safeDataset = slugify(ref.dataset);
-    const safeVersion = slugify(ref.version);
+    const safeVersion = slugify(ref.version || "latest");
     const target = ref.path
       ? path.resolve(outDir, ref.path)
       : path.join(datasetRoot, safeDataset, safeVersion);
     datasetDownloads.push(await downloadTrisolDataset(opts, ref, target, !ref.path));
+  }
+  const modelRoot = path.resolve(opt(opts, "model-out") || path.join(outDir, "models"));
+  const modelDownloads: Awaited<ReturnType<typeof downloadTrisolModel>>[] = [];
+  for (const ref of modelRefs) {
+    const target = ref.path
+      ? path.resolve(outDir, ref.path)
+      : path.join(modelRoot, slugify(ref.model), slugify(ref.version || "latest"));
+    modelDownloads.push(await downloadTrisolModel(opts, ref, target));
   }
   console.log(JSON.stringify({
     status: "downloaded",
@@ -2007,6 +2170,7 @@ async function cmdTaskDownload(opts: Record<string, OptValue>): Promise<void> {
     input_challenge_id: inputChallengeId,
     outDir,
     datasets: datasetDownloads,
+    models: modelDownloads,
   }, null, 2));
 }
 
