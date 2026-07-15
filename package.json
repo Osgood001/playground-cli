@@ -1,6 +1,6 @@
 {
   "name": "@paper2arm/playground-cli",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "private": true,
   "description": "TypeScript CLI for Playground/Harbor task upload, download, conversion, and submission.",
   "repository": {

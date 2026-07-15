@@ -9,7 +9,7 @@ import * as path from "node:path";
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type OptValue = string | boolean | string[];
 
-const VERSION = "0.1.13";
+const VERSION = "0.1.14";
 const DEFAULT_PLAY_API = "http://vxzj1507371.bohrium.tech:50001/api";
 const DEFAULT_WORKER_API = "http://47.92.88.121:443/api";
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), ".playground", "config.json");
@@ -22,11 +22,11 @@ const BUILTIN_TASK_CONFIGS: Record<string, Record<string, Json>> = {
     trisol: {
       model: { model: "esm2-150m-protein-language-model", version: "v0.1" },
       datasets: [
-        { dataset: "uniprot-goa", version: "v1" },
-        { dataset: "native-protein-structures-pdb", version: "v1.0" },
-        { dataset: "biolip", version: "v1" },
-        { dataset: "string-database-v11-0", version: "v11.0" },
-        { dataset: "uniref90-sequence-clusters", version: "v0.1" },
+        { dataset: "2074124339455733760", version: "v1" },
+        { dataset: "2074129078138441728", version: "v1" },
+        { dataset: "2074208240752668672", version: "v1" },
+        { dataset: "2077075862741585920", version: "v12.0" },
+        { dataset: "2077086098114228224", version: "v0.1" },
       ],
     },
   },
@@ -1509,9 +1509,12 @@ function parseDatasetOptions(values: string[]): TrisolDatasetRef[] {
 }
 
 function datasetRefFromObject(obj: Record<string, any>): TrisolDatasetRef[] {
+  if (stringValue(obj.type) && stringValue(obj.type) !== "dataset") return [];
   const dataset = stringValue(obj.dataset)
     || stringValue(obj.dataset_id)
     || stringValue(obj.datasetId)
+    || stringValue(obj.trisol_id)
+    || stringValue(obj.trisolId)
     || stringValue(obj.id)
     || stringValue(obj.name);
   const version = stringValue(obj.version)
@@ -1573,9 +1576,12 @@ function datasetRefsFromChallenge(challenge: Record<string, any>): TrisolDataset
 }
 
 function modelRefFromObject(obj: Record<string, any>): TrisolModelRef[] {
+  if (stringValue(obj.type) && stringValue(obj.type) !== "model") return [];
   const model = stringValue(obj.model)
     || stringValue(obj.model_id)
     || stringValue(obj.modelId)
+    || stringValue(obj.trisol_id)
+    || stringValue(obj.trisolId)
     || stringValue(obj.id)
     || stringValue(obj.name);
   const version = stringValue(obj.version)
@@ -1638,6 +1644,7 @@ function modelRefsFromChallenge(challenge: Record<string, any>): TrisolModelRef[
     ...collectModelRefs(challenge.model),
     ...collectModelRefs(asPlainObject(challenge.meta)?.models),
     ...collectModelRefs(asPlainObject(challenge.meta)?.model),
+    ...collectModelRefs(challenge.resources),
     ...collectModelRefs(config?.models),
     ...collectModelRefs(config?.model),
     ...collectModelRefs(asPlainObject(config?.trisol)?.models),
