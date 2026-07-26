@@ -1,0 +1,38 @@
+{
+  "name": "@paper2arm/playground-cli",
+  "version": "0.1.21",
+  "private": true,
+  "description": "TypeScript CLI for Playground/Harbor task upload, download, conversion, and submission.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Osgood001/playground-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Osgood001/playground-cli/issues"
+  },
+  "homepage": "https://github.com/Osgood001/playground-cli#readme",
+  "type": "module",
+  "bin": {
+    "playground": "./dist/index.js"
+  },
+  "files": [
+    "dist/",
+    "src/",
+    "README.md",
+    "package.json",
+    "tsconfig.json"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "postinstall": "node ./dist/index.js doctor --install-if-missing --quiet || true",
+    "start": "node dist/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "typescript": "^5.5.4"
+  }
+}
