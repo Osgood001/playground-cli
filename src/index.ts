@@ -9,7 +9,7 @@ import * as path from "node:path";
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type OptValue = string | boolean | string[];
 
-const VERSION = "0.1.21";
+const VERSION = "0.1.22";
 const DEFAULT_PLAY_API = "https://play.bohrium.com/";
 const DEFAULT_WORKER_API = "http://47.92.88.121:443/api";
 const EMBEDDED_WORKER_TOKEN = "asp_b1f27e79d67e37505a212591a8a0d4998bff722f0d345dd1";
@@ -1621,21 +1621,72 @@ function matchesTagFilter(row: Record<string, any>, wantedTags: string[]): boole
   });
 }
 
-async function fetchChallengeRows(base: string, token?: string): Promise<Record<string, any>[]> {
-  const urls = [
-    `${base}/challenges`,
-    `${publicBaseFromApi(base)}/data/challenges.json`,
-  ];
+interface ChallengeRowsResult {
+  rows: Record<string, any>[];
+  total: number;
+}
+
+async function fetchChallengeRows(base: string, token?: string, maxRows = Number.POSITIVE_INFINITY): Promise<ChallengeRowsResult> {
+  const requestedRows = Number.isFinite(maxRows) ? Math.max(1, Math.floor(maxRows)) : Number.POSITIVE_INFINITY;
+  const apiUrl = `${base}/challenges`;
   const errors: string[] = [];
-  for (const url of urls) {
-    try {
-      const payload = await requestJson<unknown>(url, {}, token);
-      const rows = challengeRowsFromPayload(payload);
-      if (rows.length > 0) return rows;
-      errors.push(`${url}: empty challenge list`);
-    } catch (error) {
-      errors.push(`${url}: ${error instanceof Error ? error.message : String(error)}`);
+
+  try {
+    const rows: Record<string, any>[] = [];
+    const seenIds = new Set<string>();
+    const perPage = Number.isFinite(requestedRows) ? Math.min(200, requestedRows) : 200;
+    let page = 1;
+    let reportedTotal = 0;
+    while (rows.length < requestedRows) {
+      const payload = await requestJson<unknown>(`${apiUrl}?page=${page}&per_page=${perPage}`, {}, token);
+      const pageRows = challengeRowsFromPayload(payload);
+      if (pageRows.length === 0) {
+        if (page === 1) throw new CliError("empty challenge list");
+        break;
+      }
+
+      let added = 0;
+      for (const row of pageRows) {
+        const id = String(row.id);
+        if (seenIds.has(id)) continue;
+        seenIds.add(id);
+        rows.push(row);
+        added += 1;
+        if (rows.length >= requestedRows) break;
+      }
+
+      const meta = asPlainObject(payload);
+      const total = numberValue(meta?.total);
+      if (total > 0) reportedTotal = total;
+      const currentPage = numberValue(meta?.page) || page;
+      const pages = numberValue(meta?.pages);
+      const hasMore = typeof meta?.has_more === "boolean"
+        ? meta.has_more
+        : pages > 0
+          ? currentPage < pages
+          : false;
+      if (!hasMore || (reportedTotal > 0 && rows.length >= reportedTotal)) break;
+      if (added === 0) throw new CliError(`challenge page ${page} repeated without new rows`);
+      page = currentPage + 1;
     }
+    if (rows.length > 0) return { rows, total: reportedTotal || rows.length };
+  } catch (error) {
+    errors.push(`${apiUrl}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const fallbackUrl = `${publicBaseFromApi(base)}/data/challenges.json`;
+  try {
+    const payload = await requestJson<unknown>(fallbackUrl, {}, token);
+    const allRows = challengeRowsFromPayload(payload);
+    if (allRows.length > 0) {
+      return {
+        rows: Number.isFinite(requestedRows) ? allRows.slice(0, requestedRows) : allRows,
+        total: allRows.length,
+      };
+    }
+    errors.push(`${fallbackUrl}: empty challenge list`);
+  } catch (error) {
+    errors.push(`${fallbackUrl}: ${error instanceof Error ? error.message : String(error)}`);
   }
   throw new CliError(`Could not load challenge list.\n${errors.join("\n")}`);
 }
@@ -1644,7 +1695,7 @@ async function resolveChallengeId(base: string, token: string | undefined, input
   if (!/^\d+$/.test(input)) return input;
   const index = Number(input);
   if (!Number.isSafeInteger(index) || index < 1) return input;
-  const rows = await fetchChallengeRows(base, token);
+  const { rows } = await fetchChallengeRows(base, token, index);
   const row = rows[index - 1];
   if (!row || !stringValue(row.id)) {
     throw new CliError(`No challenge at numeric index ${input}. Run 'playground task list --limit 20' to see available challenge ids.`);
@@ -2374,21 +2425,26 @@ async function cmdTaskList(opts: Record<string, OptValue>): Promise<void> {
   const config = await loadConfig(opts);
   const base = apiBase(opts, config);
   const token = bearerToken(opts, config);
-  const rows = await fetchChallengeRows(base, token);
   const tagFilters = optAll(opts, "tag")
     .flatMap((value) => value.split(","))
     .map((value) => value.trim())
     .filter(Boolean);
-  const filteredRows = rows.filter((row) => matchesTagFilter(row, tagFilters));
   const rawLimit = Number(opt(opts, "limit") || "30");
   const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.floor(rawLimit) : 30;
+  const challengeRows = await fetchChallengeRows(
+    base,
+    token,
+    tagFilters.length > 0 ? Number.POSITIVE_INFINITY : limit,
+  );
+  const filteredRows = challengeRows.rows.filter((row) => matchesTagFilter(row, tagFilters));
+  const visibleTotal = tagFilters.length > 0 ? filteredRows.length : challengeRows.total;
   const selected = filteredRows.slice(0, limit);
   if (flag(opts, "json")) {
     console.log(JSON.stringify({
       schema_version: "playground-task-list/v0",
       api_base: base,
-      total: filteredRows.length,
-      total_unfiltered: rows.length,
+      total: visibleTotal,
+      total_unfiltered: challengeRows.total,
       tag_filter: tagFilters,
       tasks: selected.map((row, index) => ({
         index: index + 1,
@@ -2413,9 +2469,9 @@ async function cmdTaskList(opts: Record<string, OptValue>): Promise<void> {
     const suffix = title ? `  ${title}` : "";
     console.log(`${index + 1}\t${String(row.id)}${tagText}${suffix}`);
   }
-  if (filteredRows.length > selected.length) {
+  if (visibleTotal > selected.length) {
     const filterText = tagFilters.length ? ` matching tag ${tagFilters.join(",")}` : "";
-    console.error(`Showing ${selected.length}/${filteredRows.length}${filterText}; pass --limit ${filteredRows.length} to show all.`);
+    console.error(`Showing ${selected.length}/${visibleTotal}${filterText}; pass --limit ${visibleTotal} to show all.`);
   }
 }
 
