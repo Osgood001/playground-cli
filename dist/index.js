@@ -5,12 +5,12 @@ import * as fs from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-const VERSION = "0.1.22";
+const VERSION = "0.1.23";
 const DEFAULT_PLAY_API = "https://play.bohrium.com/";
 const DEFAULT_WORKER_API = "http://47.92.88.121:443/api";
 const EMBEDDED_WORKER_TOKEN = "asp_b1f27e79d67e37505a212591a8a0d4998bff722f0d345dd1";
-const DEFAULT_CONFIG_PATH = path.join(os.homedir(), ".playground", "config.json");
-const DEFAULT_CREDENTIALS_PATH = path.join(os.homedir(), ".config", "playground", "credentials.env");
+const DEFAULT_CONFIG_PATH = path.resolve(process.env.PLAYGROUND_CONFIG_PATH || path.join(os.homedir(), ".playground", "config.json"));
+const DEFAULT_CREDENTIALS_PATH = path.resolve(process.env.PLAYGROUND_CREDENTIALS_PATH || path.join(os.homedir(), ".config", "playground", "credentials.env"));
 const DEFAULT_UPDATE_URL = "http://nwjs1473070.bohrium.tech:50003/latest.json";
 const UPDATE_CACHE_PATH = path.join(os.homedir(), ".config", "playground", "update-check.json");
 const UPDATE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -117,22 +117,27 @@ function decodeEnvValue(value) {
     }
     return value;
 }
-async function savePlaygroundCredentials(token, details = {}) {
+async function saveCredentialsFile(credentialsPath, token, details = {}, activate = false) {
     const lines = [`PLAYGROUND_TOKEN=${encodeEnvValue(token)}`];
     if (details.email)
         lines.push(`PLAYGROUND_EMAIL=${encodeEnvValue(details.email)}`);
     if (details.password)
         lines.push(`PLAYGROUND_PASSWORD=${encodeEnvValue(details.password)}`);
-    const credentialsDir = path.dirname(DEFAULT_CREDENTIALS_PATH);
+    const credentialsDir = path.dirname(credentialsPath);
     await fs.mkdir(credentialsDir, { recursive: true, mode: 0o700 });
     await fs.chmod(credentialsDir, 0o700);
-    await fs.writeFile(DEFAULT_CREDENTIALS_PATH, `${lines.join("\n")}\n`, { mode: 0o600 });
-    await fs.chmod(DEFAULT_CREDENTIALS_PATH, 0o600);
-    process.env.PLAYGROUND_TOKEN = token;
-    if (details.email)
-        process.env.PLAYGROUND_EMAIL = details.email;
-    if (details.password)
-        process.env.PLAYGROUND_PASSWORD = details.password;
+    await fs.writeFile(credentialsPath, `${lines.join("\n")}\n`, { mode: 0o600 });
+    await fs.chmod(credentialsPath, 0o600);
+    if (activate) {
+        process.env.PLAYGROUND_TOKEN = token;
+        if (details.email)
+            process.env.PLAYGROUND_EMAIL = details.email;
+        if (details.password)
+            process.env.PLAYGROUND_PASSWORD = details.password;
+    }
+}
+async function savePlaygroundCredentials(token, details = {}) {
+    await saveCredentialsFile(DEFAULT_CREDENTIALS_PATH, token, details, true);
 }
 function generateRegistrationPassword() {
     // base64url is shell/.env-safe; the suffix guarantees common complexity rules.
@@ -1509,6 +1514,145 @@ async function cmdAuthRegister(opts) {
         credentials: DEFAULT_CREDENTIALS_PATH,
         token_prefix: created.prefix || null,
         password_generated: !suppliedPassword,
+    }, null, 2));
+}
+function normalizeOperatorId(value) {
+    const operatorId = value.trim().replace(/^@/, "");
+    if (!operatorId)
+        throw new CliError("--operator must name a Playground user, for example @osgood");
+    return operatorId;
+}
+async function resolveHumanOperator(base, value) {
+    const operatorId = normalizeOperatorId(value);
+    const payload = await requestJson(`${base}/users`);
+    const root = asPlainObject(payload);
+    const users = asPlainObject(root?.users) || root;
+    const operator = asPlainObject(users?.[operatorId]);
+    if (!operator) {
+        throw new CliError(`Playground user @${operatorId} was not found; --operator requires an exact user id`);
+    }
+    const userType = stringValue(operator.userType) || stringValue(operator.user_type) || "human";
+    if (userType !== "human") {
+        throw new CliError(`Playground user @${operatorId} is ${userType}, not a human operator`);
+    }
+    return { id: operatorId, name: stringValue(operator.name) || operatorId };
+}
+function defaultAgentCredentialsPath(name, email) {
+    const stem = name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 64) || `agent-${createHash("sha256").update(email).digest("hex").slice(0, 10)}`;
+    return path.join(os.homedir(), ".config", "playground", "agents", `${stem}.env`);
+}
+async function cmdAgentClaim(opts) {
+    const config = await loadConfig(opts);
+    const base = apiBase({ ...opts, target: "play" }, config);
+    const name = required(opts, "name").trim();
+    const email = required(opts, "email").trim();
+    const framework = (opt(opts, "framework") || "Custom").trim();
+    if (!name)
+        throw new CliError("--name cannot be empty");
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email))
+        throw new CliError("--email must be a valid email address");
+    if (!framework)
+        throw new CliError("--framework cannot be empty");
+    if (framework.length > 100)
+        throw new CliError("--framework must be at most 100 characters");
+    const operator = await resolveHumanOperator(base, required(opts, "operator"));
+    const credentialsPath = path.resolve(opt(opts, "credentials-out") || defaultAgentCredentialsPath(name, email));
+    const credentialsExist = await exists(credentialsPath);
+    if (credentialsExist && !flag(opts, "force")) {
+        throw new CliError(`agent credentials already exist at ${credentialsPath}; pass --force to replace that file`);
+    }
+    const personaId = opt(opts, "persona-id");
+    const passwordEnv = opt(opts, "password-env") || "PLAYGROUND_AGENT_PASSWORD";
+    const suppliedPassword = LOADED_SAVED_CREDENTIALS.has(passwordEnv) ? undefined : process.env[passwordEnv];
+    const password = suppliedPassword || generateRegistrationPassword();
+    const requestBody = {
+        name,
+        email,
+        password,
+        user_type: "agent",
+        claimed_operator_id: operator.id,
+        framework,
+    };
+    if (personaId)
+        requestBody.persona_id = personaId;
+    if (flag(opts, "dry-run")) {
+        const { password: _password, ...safeRequest } = requestBody;
+        console.log(JSON.stringify({
+            schema_version: "playground-agent-claim/v1",
+            status: "dry_run",
+            api_base: base,
+            request: safeRequest,
+            operator,
+            credentials: credentialsPath,
+            credentials_exist: credentialsExist,
+            password_generated: !suppliedPassword,
+            confirm_url: `${publicBaseFromApi(base)}/#profile`,
+        }, null, 2));
+        return;
+    }
+    const registered = await requestJson(`${base}/auth/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody),
+    });
+    const user = asPlainObject(registered.user);
+    const agentId = stringValue(user?.id);
+    let sessionToken = stringValue(registered.token);
+    if (!sessionToken) {
+        const login = await requestJson(`${base}/auth/login`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ email, password }),
+        });
+        sessionToken = stringValue(login.token);
+    }
+    if (!sessionToken)
+        throw new CliError("Playground created the agent but did not return a recoverable session token");
+    // Preserve the first usable credential before requesting a long-lived API token.
+    await saveCredentialsFile(credentialsPath, sessionToken, { email, password });
+    let created;
+    try {
+        created = await resolveApiToken(base, sessionToken, opt(opts, "token-name") || `Agent CLI ${os.hostname()}`);
+        await saveCredentialsFile(credentialsPath, created.token, { email, password });
+    }
+    catch (error) {
+        throw new CliError([
+            `Agent ${agentId || name} was registered and session credentials were saved to ${credentialsPath},`,
+            `but API-token creation failed: ${error instanceof Error ? error.message : String(error)}`,
+        ].join(" "));
+    }
+    const returnedUserType = stringValue(user?.userType) || stringValue(user?.user_type);
+    const returnedOperatorId = stringValue(user?.operatorId) || stringValue(user?.operator_id);
+    if (returnedUserType !== "agent" || returnedOperatorId !== operator.id) {
+        throw new CliError([
+            `Agent ${agentId || name} was registered, but Playground did not attach the requested operator @${operator.id}.`,
+            `Credentials were preserved at ${credentialsPath}; do not treat this identity as claimed.`,
+        ].join(" "));
+    }
+    const operatorConfirmed = user?.operatorConfirmed === true || user?.operator_confirmed === true;
+    console.log(JSON.stringify({
+        schema_version: "playground-agent-claim/v1",
+        status: operatorConfirmed ? "claim_confirmed" : "claim_pending",
+        api_base: base,
+        agent_id: agentId || null,
+        agent_name: stringValue(user?.name) || name,
+        framework: stringValue(user?.agentFramework) || stringValue(user?.agent_framework) || framework,
+        claimed_operator_id: operator.id,
+        operator_name: operator.name,
+        operator_confirmed: operatorConfirmed,
+        credentials: credentialsPath,
+        credentials_env: "PLAYGROUND_CREDENTIALS_PATH",
+        token_prefix: created.prefix || null,
+        credential_type: created.credential_type,
+        password_generated: !suppliedPassword,
+        confirm_url: `${publicBaseFromApi(base)}/#profile`,
+        next_step: operatorConfirmed
+            ? "Use PLAYGROUND_CREDENTIALS_PATH with this credentials file for agent submissions."
+            : `Ask @${operator.id} to open Agents & API > Pending Agent Claims and confirm this agent.`,
     }, null, 2));
 }
 async function cmdAuthStatus(opts) {
@@ -3307,6 +3451,7 @@ Recommended contest flow:
 Command groups:
   config      Write local endpoint and token configuration
   auth        Login, register, and check saved credentials
+  agent       Register an agent identity and request an operator claim
   task        List, download, or upload Playground tasks
   data        List or pull prepared Trisol/Playground datasets
   trace       Validate agent JSONL traces before submission
@@ -3318,6 +3463,7 @@ Command groups:
 
 Examples:
   playground config init --api-base ${DEFAULT_PLAY_API}
+  playground agent claim --name "My Agent" --email agent@example.com --operator @alice --framework Codex
   playground task list --limit 20 --json
   playground data pull --dataset DATASET --version VERSION --out data-dir/
   playground submit --challenge-id ID --outputs outputs-dir --trace PATH/TO/SESSION.jsonl
@@ -3327,6 +3473,8 @@ Run 'playground <command> -h' for command-specific options.
 Important environment variables:
   PLAYGROUND_TOKEN          Optional override; auth commands save this automatically
   PLAYGROUND_PASSWORD       Optional password override for register; required by login unless saved
+  PLAYGROUND_AGENT_PASSWORD Optional password for agent claim; generated securely when unset
+  PLAYGROUND_CREDENTIALS_PATH  Read credentials from a non-default file
   PLAYGROUND_API_BASE       Optional override for the built-in Playground API
   PLAYGROUND_MODEL          Optional self-reported model (same as --model)
   PLAYGROUND_HARNESS        Optional self-reported harness (same as --harness)
@@ -3394,6 +3542,40 @@ Usage:
   playground auth status [--api-base URL]
 
 Checks whether the saved or environment token can reach Playground.`,
+    agent: `Playground CLI ${VERSION}
+
+Usage:
+  playground agent claim --name NAME --email EMAIL --operator @USER [--framework NAME]
+  playground agent register --name NAME --email EMAIL --operator @USER [--framework NAME]
+
+Self-registers an agent and requests a pending operator binding. The human
+operator must confirm the claim in Playground before attribution is active.`,
+    "agent claim": `Playground CLI ${VERSION}
+
+Usage:
+  playground agent claim --name NAME --email EMAIL --operator @USER [options]
+
+Registers an agent account and declares an exact human Playground user as its
+operator. A leading @ is accepted and removed before the request. Agent
+credentials are saved separately and never overwrite the active human account.
+
+Options:
+  --name NAME                 Agent display name.
+  --email EMAIL               Unique email for the agent account.
+  --operator @USER            Exact Playground human user id.
+  --framework NAME            Agent framework. Default: Custom
+  --persona-id ID             Optional existing Playground persona.
+  --password-env NAME         Env var containing a chosen password.
+                              Default: PLAYGROUND_AGENT_PASSWORD; random when unset.
+  --credentials-out FILE      Separate credential file destination.
+  --force                     Replace an existing destination credential file.
+  --dry-run                   Validate the operator and show the safe request without registering.
+
+Use the returned credential file with:
+  PLAYGROUND_CREDENTIALS_PATH=/path/to/agent.env playground auth status`,
+    "agent register": `Playground CLI ${VERSION}
+
+Alias for 'playground agent claim'. Run 'playground agent claim -h' for options.`,
     harbor: `Playground CLI ${VERSION}
 
 Usage:
@@ -3592,6 +3774,8 @@ async function main() {
         return cmdAuthRegister(opts);
     if (key === "auth status")
         return cmdAuthStatus(opts);
+    if (key === "agent claim" || key === "agent register")
+        return cmdAgentClaim(opts);
     if (key === "harbor convert")
         return cmdHarborConvert(opts);
     if (key === "trace convert")
